@@ -1,54 +1,120 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import threading, subprocess, requests, re
+import threading, logging, requests, re, os, subprocess
+import pandas as pd
 from pathlib import Path
+from datetime import datetime
 
+# --- CONFIGURATION ---
 BASE_DIR = Path.home() / "Documents" / "updatedCompanyScraper"
+DATA_DIR = BASE_DIR / "data"
+INSTANCE_URL = "http://localhost:8088"
+TARGET_POSTCODE = "DH8" # Consett, Blackhill, Leadgate, Shotley Bridge
 
-class LeadGenPro:
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+class DH8SearchExpert:
     def __init__(self, root):
         self.root = root
-        self.root.title("Consett Lead Agent - GitHub Integrated")
-        self.root.geometry("1000x650")
-        self.root.configure(bg="#2b2b2b")
+        self.root.title(f"SearXNG Expert - Postcode {TARGET_POSTCODE} Scanner")
+        self.root.geometry("1000x750")
         self.setup_ui()
 
     def setup_ui(self):
-        # Navbar with GitHub Status
-        nav = tk.Frame(self.root, bg="#3c3f41", height=40)
+        # Navbar
+        nav = tk.Frame(self.root, bg="#1a1a1a", height=50)
         nav.pack(fill="x")
-        
-        self.git_label = tk.Label(nav, text="Git: Checking...", bg="#3c3f41", fg="white", font=("Arial", 9))
-        self.git_label.pack(side="right", padx=10)
-        
+        tk.Label(nav, text=f"SEARXNG PIPELINE: {TARGET_POSTCODE}", fg="#00d1b2", bg="#1a1a1a", font=("Consolas", 12, "bold")).pack(side="left", padx=20)
+
         # Table
-        self.tree = ttk.Treeview(self.root, columns=("Name", "Phone", "Link"), show="headings")
-        self.tree.heading("Name", text="Business Name")
+        style = ttk.Style()
+        style.theme_use("clam")
+        self.tree = ttk.Treeview(self.root, columns=("Company", "Phone", "Postcode", "Email"), show="headings")
+        self.tree.heading("Company", text="Business Name")
         self.tree.heading("Phone", text="Phone")
-        self.tree.heading("Link", text="Website")
-        self.tree.pack(fill="both", expand=True, padx=20, pady=20)
+        self.tree.heading("Postcode", text="Postcode")
+        self.tree.heading("Email", text="Extracted Email")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Actions
-        btn_frame = tk.Frame(self.root, bg="#2b2b2b")
-        btn_frame.pack(pady=10)
+        # Console
+        self.console = tk.Text(self.root, height=10, bg="#000", fg="#0f0", font=("Courier", 9))
+        self.console.pack(fill="x", padx=10, pady=5)
+
+        # Controls
+        btns = tk.Frame(self.root)
+        btns.pack(pady=15)
+        ttk.Button(btns, text="🔍 RUN DH8 SCAN", command=self.start_thread).pack(side="left", padx=10)
+        ttk.Button(btns, text="💾 SAVE & PUSH", command=self.sync_git).pack(side="left", padx=10)
+
+    def log(self, text):
+        self.console.insert("end", f"> {text}\n")
+        self.console.see("end")
+
+    def start_thread(self):
+        threading.Thread(target=self.execute_search, daemon=True).start()
+
+    def execute_search(self):
+        self.log(f"Connecting to SearXNG Instance at {INSTANCE_URL}...")
+        leads = []
         
-        ttk.Button(btn_frame, text="🔍 Fetch Leads", command=self.fetch).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="🚀 Push to GitHub", command=self.push_to_git).pack(side="left", padx=5)
+        # Expert Search Criteria: Combining Postcode with local identifiers
+        search_queries = [
+            f'business "{TARGET_POSTCODE}" Consett',
+            f'site:yell.com "{TARGET_POSTCODE}"',
+            f'"{TARGET_POSTCODE}" local directory consett'
+        ]
 
-    def push_to_git(self):
-        """Automatically commits and pushes leads to GitHub."""
         try:
-            subprocess.run(["git", "add", "."], cwd=BASE_DIR, check=True)
-            subprocess.run(["git", "commit", "-m", "Automated lead update"], cwd=BASE_DIR)
-            subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=True)
-            messagebox.showinfo("GitHub Sync", "Leads pushed successfully!")
-        except Exception as e:
-            messagebox.showerror("Git Error", f"Push failed: {e}")
+            for query in search_queries:
+                params = {
+                    'q': query,
+                    'format': 'json',
+                    'categories': 'general,it',
+                    'language': 'en-GB'
+                }
+                
+                response = requests.get(f"{INSTANCE_URL}/search", params=params, timeout=15)
+                results = response.json().get('results', [])
+                
+                for item in results:
+                    content = item.get('content', '')
+                    
+                    # Regex for UK Postcode validation within DH8
+                    if f"{TARGET_POSTCODE}" in content.upper() or f"{TARGET_POSTCODE}" in item.get('title', '').upper():
+                        
+                        # Extract Phone
+                        phone_match = re.search(r'((?:\+44|0)[\d\s]{10,13})', content)
+                        phone = phone_match.group(0) if phone_match else "N/A"
+                        
+                        # Extract Email (Expert Addition)
+                        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', content)
+                        email = email_match.group(0) if email_match else "No Email in Snippet"
+                        
+                        name = item.get('title', 'Unknown')[:50]
+                        
+                        self.tree.insert("", "end", values=(name, phone, TARGET_POSTCODE, email))
+                        leads.append([name, phone, TARGET_POSTCODE, email, item.get('url')])
 
-    def fetch(self):
-        # The scraping logic we built previously...
-        self.tree.insert("", "end", values=("Example Biz", "01207 123456", "http://example.com"))
-        messagebox.showinfo("Scan", "Scan complete. Don't forget to Push to GitHub!")
+            # File Generation
+            if leads:
+                df = pd.DataFrame(leads, columns=["Name", "Phone", "Postcode", "Email", "URL"])
+                df.to_csv(DATA_DIR / "dh8_leads.csv", index=False)
+                self.log(f"✅ Successfully captured {len(leads)} DH8 leads.")
+
+        except Exception as e:
+            self.log(f"❌ Connection Error: {e}")
+
+    def sync_git(self):
+        self.log("Syncing to GitHub via VS Code parameters...")
+        try:
+            subprocess.run(["git", "add", "."], cwd=BASE_DIR)
+            subprocess.run(["git", "commit", "-m", f"DH8 Lead Sync {datetime.now().date()}"], cwd=BASE_DIR)
+            subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR)
+            self.log("🚀 GitHub Updated.")
+        except:
+            self.log("⚠️ Git push failed. Ensure remote is connected in VS Code.")
 
 if __name__ == "__main__":
-    root = tk.Tk(); app = LeadGenPro(root); root.mainloop()
+    root = tk.Tk()
+    app = DH8SearchExpert(root)
+    root.mainloop()

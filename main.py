@@ -1,120 +1,87 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-import threading, logging, requests, re, os, subprocess
+import requests
+import re
+import json
 import pandas as pd
-from pathlib import Path
-from datetime import datetime
+from bs4 import BeautifulSoup
 
 # --- CONFIGURATION ---
-BASE_DIR = Path.home() / "Documents" / "updatedCompanyScraper"
-DATA_DIR = BASE_DIR / "data"
-INSTANCE_URL = "http://localhost:8088"
-TARGET_POSTCODE = "DH8" # Consett, Blackhill, Leadgate, Shotley Bridge
+INSTANCE_URL = "http://127.0.0.1:8088"
+TARGET_DOMAIN = "glstech.co.uk"
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0'
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Regex for UK Phones (Landlines like 01207 and Mobiles 07xxx)
+PHONE_REGEX = r'(?:(?:\+44\s?\(0\)\s?\d{2,5})|(?:\+44\s?\d{2,5})|(?:0\d{2,5}))(?:\s?\d{3,4}){1,2}'
+EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
-class DH8SearchExpert:
-    def __init__(self, root):
-        self.root = root
-        self.root.title(f"SearXNG Expert - Postcode {TARGET_POSTCODE} Scanner")
-        self.root.geometry("1000x750")
-        self.setup_ui()
-
-    def setup_ui(self):
-        # Navbar
-        nav = tk.Frame(self.root, bg="#1a1a1a", height=50)
-        nav.pack(fill="x")
-        tk.Label(nav, text=f"SEARXNG PIPELINE: {TARGET_POSTCODE}", fg="#00d1b2", bg="#1a1a1a", font=("Consolas", 12, "bold")).pack(side="left", padx=20)
-
-        # Table
-        style = ttk.Style()
-        style.theme_use("clam")
-        self.tree = ttk.Treeview(self.root, columns=("Company", "Phone", "Postcode", "Email"), show="headings")
-        self.tree.heading("Company", text="Business Name")
-        self.tree.heading("Phone", text="Phone")
-        self.tree.heading("Postcode", text="Postcode")
-        self.tree.heading("Email", text="Extracted Email")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
-
-        # Console
-        self.console = tk.Text(self.root, height=10, bg="#000", fg="#0f0", font=("Courier", 9))
-        self.console.pack(fill="x", padx=10, pady=5)
-
-        # Controls
-        btns = tk.Frame(self.root)
-        btns.pack(pady=15)
-        ttk.Button(btns, text="🔍 RUN DH8 SCAN", command=self.start_thread).pack(side="left", padx=10)
-        ttk.Button(btns, text="💾 SAVE & PUSH", command=self.sync_git).pack(side="left", padx=10)
-
-    def log(self, text):
-        self.console.insert("end", f"> {text}\n")
-        self.console.see("end")
-
-    def start_thread(self):
-        threading.Thread(target=self.execute_search, daemon=True).start()
-
-    def execute_search(self):
-        self.log(f"Connecting to SearXNG Instance at {INSTANCE_URL}...")
-        leads = []
+def deep_scan_url(url):
+    """Visits the actual website to extract hidden contact info."""
+    print(f"   ∟ 🕵️ Deep Scanning: {url}")
+    try:
+        response = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=8)
+        if response.status_code != 200:
+            return "N/A", "N/A"
         
-        # Expert Search Criteria: Combining Postcode with local identifiers
-        search_queries = [
-            f'business "{TARGET_POSTCODE}" Consett',
-            f'site:yell.com "{TARGET_POSTCODE}"',
-            f'"{TARGET_POSTCODE}" local directory consett'
-        ]
+        soup = BeautifulSoup(response.text, 'html.parser')
+        page_text = soup.get_text()
 
-        try:
-            for query in search_queries:
-                params = {
-                    'q': query,
-                    'format': 'json',
-                    'categories': 'general,it',
-                    'language': 'en-GB'
-                }
-                
-                response = requests.get(f"{INSTANCE_URL}/search", params=params, timeout=15)
-                results = response.json().get('results', [])
-                
-                for item in results:
-                    content = item.get('content', '')
-                    
-                    # Regex for UK Postcode validation within DH8
-                    if f"{TARGET_POSTCODE}" in content.upper() or f"{TARGET_POSTCODE}" in item.get('title', '').upper():
-                        
-                        # Extract Phone
-                        phone_match = re.search(r'((?:\+44|0)[\d\s]{10,13})', content)
-                        phone = phone_match.group(0) if phone_match else "N/A"
-                        
-                        # Extract Email (Expert Addition)
-                        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', content)
-                        email = email_match.group(0) if email_match else "No Email in Snippet"
-                        
-                        name = item.get('title', 'Unknown')[:50]
-                        
-                        self.tree.insert("", "end", values=(name, phone, TARGET_POSTCODE, email))
-                        leads.append([name, phone, TARGET_POSTCODE, email, item.get('url')])
+        # 1. Look for emails (Regex + mailto links)
+        emails = re.findall(EMAIL_REGEX, page_text)
+        mailto_links = [a['href'].replace('mailto:', '') for a in soup.select('a[href^="mailto:"]')]
+        all_emails = list(set(emails + mailto_links))
+        
+        # 2. Look for phones
+        phones = re.findall(PHONE_REGEX, page_text)
+        
+        # Clean up and return first found
+        email_res = all_emails[0] if all_emails else "N/A"
+        phone_res = phones[0] if phones else "N/A"
+        
+        return email_res, phone_res
+    except Exception:
+        return "N/A", "N/A"
 
-            # File Generation
-            if leads:
-                df = pd.DataFrame(leads, columns=["Name", "Phone", "Postcode", "Email", "URL"])
-                df.to_csv(DATA_DIR / "dh8_leads.csv", index=False)
-                self.log(f"✅ Successfully captured {len(leads)} DH8 leads.")
+def run_expert_scraper():
+    print(f"🚀 Starting Search for {TARGET_DOMAIN}...")
+    
+    params = {'q': f'site:{TARGET_DOMAIN}', 'format': 'json'}
+    headers = {'User-Agent': USER_AGENT, 'Referer': f"{INSTANCE_URL}/"}
 
-        except Exception as e:
-            self.log(f"❌ Connection Error: {e}")
+    try:
+        # Step 1: Get results from your Local SearXNG
+        response = requests.get(f"{INSTANCE_URL}/search", params=params, headers=headers)
+        if response.status_code != 200:
+            print(f"❌ Server Error: {response.status_code}")
+            return
 
-    def sync_git(self):
-        self.log("Syncing to GitHub via VS Code parameters...")
-        try:
-            subprocess.run(["git", "add", "."], cwd=BASE_DIR)
-            subprocess.run(["git", "commit", "-m", f"DH8 Lead Sync {datetime.now().date()}"], cwd=BASE_DIR)
-            subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR)
-            self.log("🚀 GitHub Updated.")
-        except:
-            self.log("⚠️ Git push failed. Ensure remote is connected in VS Code.")
+        data = response.json()
+        results = data.get('results', [])
+        final_leads = []
+
+        # Step 2: Loop results and perform Deep Scan
+        for item in results:
+            name = item.get('title', 'Unknown')
+            link = item.get('url')
+            
+            # Use Deep Scan to get the "Invisible" data
+            email, phone = deep_scan_url(link)
+            
+            final_leads.append({
+                'Company Name': name,
+                'Website': link,
+                'Email': email,
+                'Phone': phone
+            })
+
+        # Step 3: Save to JSON/CSV properly
+        df = pd.DataFrame(final_leads)
+        df.to_json('glstech_leads.json', orient='records', indent=4)
+        df.to_csv('glstech_leads.csv', index=False)
+        
+        print(f"\n✅ DONE! Found {len(final_leads)} records.")
+        print("📁 Saved to glstech_leads.json and glstech_leads.csv")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = DH8SearchExpert(root)
-    root.mainloop()
+    run_expert_scraper()

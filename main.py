@@ -1,87 +1,138 @@
+import customtkinter as ctk
+from tkinter import ttk, messagebox
+import threading
+import queue
+import logging
+import time
 import requests
-import re
 import json
-import pandas as pd
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
 
-# --- CONFIGURATION ---
-INSTANCE_URL = "http://127.0.0.1:8088"
-TARGET_DOMAIN = "glstech.co.uk"
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0'
-
-# Regex for UK Phones (Landlines like 01207 and Mobiles 07xxx)
-PHONE_REGEX = r'(?:(?:\+44\s?\(0\)\s?\d{2,5})|(?:\+44\s?\d{2,5})|(?:0\d{2,5}))(?:\s?\d{3,4}){1,2}'
-EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-
-def deep_scan_url(url):
-    """Visits the actual website to extract hidden contact info."""
-    print(f"   ∟ 🕵️ Deep Scanning: {url}")
-    try:
-        response = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=8)
-        if response.status_code != 200:
-            return "N/A", "N/A"
+class DH8IntelligenceApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
         
-        soup = BeautifulSoup(response.text, 'html.parser')
-        page_text = soup.get_text()
-
-        # 1. Look for emails (Regex + mailto links)
-        emails = re.findall(EMAIL_REGEX, page_text)
-        mailto_links = [a['href'].replace('mailto:', '') for a in soup.select('a[href^="mailto:"]')]
-        all_emails = list(set(emails + mailto_links))
+        # --- THREAD-SAFE INFRASTRUCTURE ---
+        self.log_queue = queue.Queue()
+        self.is_running = False
         
-        # 2. Look for phones
-        phones = re.findall(PHONE_REGEX, page_text)
+        # --- UI SETUP ---
+        self.title("GLSTech | DH8 AI Intelligence Dashboard")
+        self.geometry("1200x850")
+        self._setup_styles()
+        self._build_layout()
         
-        # Clean up and return first found
-        email_res = all_emails[0] if all_emails else "N/A"
-        phone_res = phones[0] if phones else "N/A"
+        # --- START QUEUE MONITOR ---
+        self.after(100, self._process_queue)
+
+    def _setup_styles(self):
+        """Configure professional dark-mode aesthetics."""
+        ctk.set_appearance_mode("dark")
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
+        self.style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", rowheight=30)
+        self.style.map("Treeview", background=[('selected', '#1f538d')])
+
+    def _build_layout(self):
+        """Created a split-pane view for Live Data and Verbose Logs."""
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=3) # Table
+        self.grid_rowconfigure(2, weight=2) # Logs
+
+        # 1. Control Header
+        self.header = ctk.CTkFrame(self)
+        self.header.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         
-        return email_res, phone_res
-    except Exception:
-        return "N/A", "N/A"
+        self.start_btn = ctk.CTkButton(self.header, text="🚀 START ENGINE", command=self.toggle_engine, fg_color="#28a745")
+        self.start_btn.pack(side="left", padx=10)
+        
+        self.status_label = ctk.CTkLabel(self.header, text="SYSTEM READY", text_color="#555")
+        self.status_label.pack(side="right", padx=10)
 
-def run_expert_scraper():
-    print(f"🚀 Starting Search for {TARGET_DOMAIN}...")
-    
-    params = {'q': f'site:{TARGET_DOMAIN}', 'format': 'json'}
-    headers = {'User-Agent': USER_AGENT, 'Referer': f"{INSTANCE_URL}/"}
+        # 2. Live Data Table
+        self.table_frame = ctk.CTkFrame(self)
+        self.table_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        
+        self.tree = ttk.Treeview(self.table_frame, columns=("Name", "Phone", "Website"), show='headings')
+        for col in ("Name", "Phone", "Website"):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=300)
+        self.tree.pack(expand=True, fill="both")
 
-    try:
-        # Step 1: Get results from your Local SearXNG
-        response = requests.get(f"{INSTANCE_URL}/search", params=params, headers=headers)
-        if response.status_code != 200:
-            print(f"❌ Server Error: {response.status_code}")
-            return
+        # 3. Live Verbose Logging View
+        self.log_view = ctk.CTkTextbox(self, fg_color="black", text_color="#00FF41", font=("Consolas", 12))
+        self.log_view.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+        self.log_view.insert("0.0", ">>> INITIALIZING VERBOSE LOG STREAM...\n")
 
-        data = response.json()
-        results = data.get('results', [])
-        final_leads = []
+    # --- THE "HEARTBEAT" LOGIC ---
+    def queue_log(self, message, level="INFO"):
+        """Background threads call this to 'drop a message in the bucket'."""
+        self.log_queue.put(f"[{time.strftime('%H:%M:%S')}] [{level}] {message}")
 
-        # Step 2: Loop results and perform Deep Scan
-        for item in results:
-            name = item.get('title', 'Unknown')
-            link = item.get('url')
+    def _process_queue(self):
+        """The GUI thread periodically checks the bucket for new logs/data."""
+        try:
+            while True: # Process all pending messages
+                msg = self.log_queue.get_nowait()
+                self.log_view.configure(state="normal")
+                self.log_view.insert("end", msg + "\n")
+                self.log_view.see("end")
+                self.log_view.configure(state="disabled")
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._process_queue) # Repeat every 100ms
+
+    # --- ENGINE LOGIC ---
+    def toggle_engine(self):
+        if not self.is_running:
+            self.is_running = True
+            self.start_btn.configure(text="🛑 STOP ENGINE", fg_color="#dc3545")
+            threading.Thread(target=self.background_worker, daemon=True).start()
+        else:
+            self.is_running = False
+            self.start_btn.configure(text="🚀 START ENGINE", fg_color="#28a745")
+
+    def background_worker(self):
+        """The Heavy Lifter: Selenium + Phi-3."""
+        self.queue_log("Booting Chromium Driver...", "DEBUG")
+        options = Options()
+        # Visual mode is better for debugging 'dying' apps
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        
+        try:
+            self.queue_log("Connecting to Yell.com (DH8)...", "NETWORK")
+            driver.get("https://www.yell.com/ucs/UcsSearchAction.do?keywords=business&location=DH8")
             
-            # Use Deep Scan to get the "Invisible" data
-            email, phone = deep_scan_url(link)
-            
-            final_leads.append({
-                'Company Name': name,
-                'Website': link,
-                'Email': email,
-                'Phone': phone
-            })
+            # Wait for content
+            time.sleep(3) 
+            cards = driver.find_elements(By.CLASS_NAME, "businessCapsule")
+            self.queue_log(f"Detected {len(cards)} entries.", "SCRAPE")
 
-        # Step 3: Save to JSON/CSV properly
-        df = pd.DataFrame(final_leads)
-        df.to_json('glstech_leads.json', orient='records', indent=4)
-        df.to_csv('glstech_leads.csv', index=False)
-        
-        print(f"\n✅ DONE! Found {len(final_leads)} records.")
-        print("📁 Saved to glstech_leads.json and glstech_leads.csv")
-
-    except Exception as e:
-        print(f"❌ Error: {e}")
+            for card in cards:
+                if not self.is_running: break
+                
+                name = card.find_element(By.TAG_NAME, "h2").text
+                self.queue_log(f"Processing: {name}", "AI_WAIT")
+                
+                # AI Logic Placeholder (Ollama Phi-3)
+                # payload = {"model": "phi3", "prompt": card.text, "stream": False}
+                # response = requests.post("http://localhost:11434/api/generate", json=payload)
+                
+                # Mock update for table safety
+                self.after(0, lambda n=name: self.tree.insert("", "end", values=(n, "Extracting...", "Extracting...")))
+                
+            self.queue_log("Full Scan Completed Successfully.", "SUCCESS")
+        except Exception as e:
+            self.queue_log(f"FATAL ERROR: {str(e)}", "CRITICAL")
+        finally:
+            driver.quit()
+            self.queue_log("Browser Session Closed.", "CLEANUP")
 
 if __name__ == "__main__":
-    run_expert_scraper()
+    app = DH8IntelligenceApp()
+    app.mainloop()

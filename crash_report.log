@@ -1,0 +1,1 @@
+2026-01-10 15:05:06,340 - CRITICAL - Mainloop failed: '_tkinter.tkapp' object has no attribute '_setup_ui'

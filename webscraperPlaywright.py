@@ -1,140 +1,202 @@
+import tkinter as tk
+from tkinter import ttk, scrolledtext
 import threading
+import queue
 import time
 import random
 import csv
-import re
 import os
+import re
 from datetime import datetime
-from queue import Queue
-
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
 
 
 # =========================
 # CONFIG
 # =========================
 
-START_URL = "https://www.lifeindurham.co.uk/business-directory/"
-MAX_RESULTS = 200
-CSV_FILENAME = f"businesses_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+SEARCH_QUERY = "Businesses in Consett"
+MAX_RESULTS = 300
+MIN_DELAY = 1.2
+MAX_DELAY = 3.2
 
-PHONE_REGEX = re.compile(r"\+?\d[\d\s().-]{7,}")
-WEBSITE_REGEX = re.compile(r"https?://[^\s\"'>]+")
+CSV_FILE = f"consett_businesses_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-MIN_DELAY = 1.5
-MAX_DELAY = 4.0
-RETRY_LIMIT = 3
+PHONE_RE = re.compile(r"\+?\d[\d\s().-]{7,}")
+URL_RE = re.compile(r"https?://[^\s]+")
 
 
 # =========================
-# GUI CLASS
+# GUI
 # =========================
 
-class ScraperGUI:
+class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Business Directory Scraper")
+        self.root.title("Consett Business Scraper")
 
-        self.queue = Queue()
-        self.scraped_count = 0
-        self.running = False
+        self.q = queue.Queue()
+        self.scraped = 0
 
-        self.build_gui()
+        self.build_ui()
         self.root.after(100, self.process_queue)
 
-    def build_gui(self):
+    def build_ui(self):
         top = ttk.Frame(self.root)
         top.pack(fill=tk.X, padx=10, pady=5)
 
-        self.start_btn = ttk.Button(top, text="Start Scraping", command=self.start_scraper)
+        self.start_btn = ttk.Button(top, text="START SCRAPING", command=self.start)
         self.start_btn.pack(side=tk.LEFT)
 
-        self.count_label = ttk.Label(top, text="Scraped: 0")
-        self.count_label.pack(side=tk.LEFT, padx=20)
+        self.counter = ttk.Label(top, text="Scraped: 0")
+        self.counter.pack(side=tk.LEFT, padx=20)
 
-        # Results table
         self.tree = ttk.Treeview(
             self.root,
             columns=("Name", "Phone", "Website"),
             show="headings",
             height=12
         )
-        for col in ("Name", "Phone", "Website"):
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=220)
 
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        for c in ("Name", "Phone", "Website"):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=260)
 
-        # Log output
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=10)
+
         self.log = scrolledtext.ScrolledText(self.root, height=10, state="disabled")
         self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
     def log_msg(self, msg):
-        self.log.configure(state="normal")
-        self.log.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} - {msg}\n")
+        self.log.config(state="normal")
+        self.log.insert(tk.END, msg + "\n")
         self.log.yview(tk.END)
-        self.log.configure(state="disabled")
+        self.log.config(state="disabled")
 
-    def start_scraper(self):
-        if self.running:
-            return
-
-        self.running = True
+    def start(self):
         self.start_btn.config(state="disabled")
-        self.log_msg(f"CSV will be saved to: {os.path.abspath(CSV_FILENAME)}")
+        self.log_msg(f"CSV will be saved to: {os.path.abspath(CSV_FILE)}")
 
-        thread = threading.Thread(
-            target=run_scraper,
-            args=(self.queue,),
-            daemon=True
-        )
-        thread.start()
+        t = threading.Thread(target=scraper_worker, args=(self.q,), daemon=False)
+        t.start()
 
     def process_queue(self):
         try:
             while True:
-                msg = self.queue.get_nowait()
+                msg = self.q.get_nowait()
 
                 if msg["type"] == "log":
                     self.log_msg(msg["data"])
 
                 elif msg["type"] == "data":
-                    self.scraped_count += 1
-                    self.count_label.config(text=f"Scraped: {self.scraped_count}")
+                    self.scraped += 1
+                    self.counter.config(text=f"Scraped: {self.scraped}")
                     self.tree.insert("", tk.END, values=msg["data"])
 
-                elif msg["type"] == "done":
-                    self.log_msg("Scraping completed.")
-                    self.start_btn.config(state="normal")
-                    self.running = False
-
-        except Exception:
+        except queue.Empty:
             pass
 
         self.root.after(100, self.process_queue)
 
 
 # =========================
-# SCRAPER LOGIC
+# SCRAPER WORKER
 # =========================
 
-def human_delay():
+def jitter():
     time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
 
-def extract_details(text):
-    phone = ", ".join(set(PHONE_REGEX.findall(text))) or "N/A"
-    website = ", ".join(set(WEBSITE_REGEX.findall(text))) or "N/A"
-    return phone, website
+def scraper_worker(q):
+    try:
+        q.put({"type": "log", "data": "Starting Playwright..."})
+
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            context = browser.new_context(
+                viewport={"width": random.randint(1100, 1400),
+                          "height": random.randint(700, 900)},
+                user_agent=random.choice([
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "Mozilla/5.0 (X11; Linux x86_64)",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+                ])
+            )
+
+            page = context.new_page()
+
+            page.goto(
+                f"https://www.google.com/maps/search/{SEARCH_QUERY.replace(' ', '+')}",
+                timeout=60000
+            )
+
+            jitter()
+
+            seen = set()
+
+            with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Name", "Phone", "Website"])
+
+                while len(seen) < MAX_RESULTS:
+                    cards = page.query_selector_all("a[href*='/place/']")
+
+                    if not cards:
+                        q.put({"type": "log", "data": "No result cards found."})
+                        break
+
+                    for card in cards:
+                        try:
+                            card.click()
+                            page.wait_for_timeout(1200)
+
+                            panel = page.locator("div[role='main']").inner_text()
+
+                            name = panel.split("\n")[0].strip()
+                            if name in seen:
+                                continue
+
+                            seen.add(name)
+
+                            phone = ", ".join(PHONE_RE.findall(panel)) or "N/A"
+                            website = ", ".join(URL_RE.findall(panel)) or "N/A"
+
+                            writer.writerow([name, phone, website])
+                            f.flush()
+
+                            q.put({
+                                "type": "data",
+                                "data": (name, phone, website)
+                            })
+
+                            q.put({"type": "log", "data": f"Scraped: {name}"})
+
+                            jitter()
+
+                            if len(seen) >= MAX_RESULTS:
+                                break
+
+                        except Exception as e:
+                            q.put({"type": "log", "data": f"Card error: {e}"})
+
+                    # SCROLL RESULTS PANE
+                    page.mouse.wheel(0, 4000)
+                    jitter()
+
+            browser.close()
+            q.put({"type": "log", "data": "Scraping completed."})
+
+    except Exception as e:
+        q.put({"type": "log", "data": f"FATAL ERROR: {e}"})
 
 
-def run_scraper(queue):
-    queue.put({"type": "log", "data": "Launching browser..."})
+# =========================
+# MAIN
+# =========================
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
-        page = context.ne
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.geometry("900x700")
+    App(root)
+    root.mainloop()
